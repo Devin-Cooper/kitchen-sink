@@ -2246,7 +2246,7 @@ MODEL_NAME = "{data['model']}"
 
 class OpenAICompatibleHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
-        # Custom logging
+        # Custom logging with timestamps
         sys.stderr.write(f"[{{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}}] {{self.address_string()}} - {{format%args}}\\n")
     
     def do_HEAD(self):
@@ -2256,11 +2256,24 @@ class OpenAICompatibleHandler(http.server.BaseHTTPRequestHandler):
             self.send_header('Content-Type', 'application/json')
             self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
-        elif self.path == '/v1/models':
+        elif self.path == '/v1/models' or self.path == '/v1/api/tags':
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
+        elif self.path.startswith('/v1/api/'):
+            # Forward HEAD requests for Ollama API endpoints
+            ollama_path = self.path[3:]  # Remove '/v1' prefix
+            try:
+                ollama_response = requests.head(f"http://localhost:11434{{ollama_path}}", timeout=5)
+                self.send_response(ollama_response.status_code)
+                for header, value in ollama_response.headers.items():
+                    if header.lower() not in ['content-encoding', 'transfer-encoding', 'connection']:
+                        self.send_header(header, value)
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+            except Exception as e:
+                self.send_error(500, f"Error forwarding HEAD request: {{str(e)}}")
         else:
             self.send_error(404)
     
@@ -2268,7 +2281,7 @@ class OpenAICompatibleHandler(http.server.BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, HEAD')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With')
         self.end_headers()
     
     def do_GET(self):
@@ -2393,9 +2406,75 @@ class OpenAICompatibleHandler(http.server.BaseHTTPRequestHandler):
         content_length = int(self.headers.get('Content-Length', 0))
         post_data = self.rfile.read(content_length)
         
+        print(f"POST request to: {{self.path}}", file=sys.stderr)
+        
+        # Handle Ollama-specific API endpoints first (before JSON parsing)
+        if self.path.startswith('/v1/api/'):
+            ollama_path = self.path[3:]  # Remove '/v1' prefix
+            
+            try:
+                # Prepare headers for forwarding
+                headers = {{}}
+                for k, v in self.headers.items():
+                    if k.lower() not in ['host', 'content-length']:
+                        headers[k] = v
+                
+                # Ensure Content-Type is set for JSON requests
+                if ollama_path == '/api/chat':
+                    headers['Content-Type'] = 'application/json'
+                    
+                    # Special handling for chat requests - modify to use current model
+                    try:
+                        request_data = json.loads(post_data)
+                        # Override model with currently loaded model
+                        request_data['model'] = MODEL_NAME
+                        post_data = json.dumps(request_data).encode()
+                        headers['Content-Length'] = str(len(post_data))
+                        print(f"Modified chat request to use model: {{MODEL_NAME}}", file=sys.stderr)
+                    except json.JSONDecodeError:
+                        print(f"Failed to parse JSON for chat request", file=sys.stderr)
+                        # Continue with original data
+                elif post_data and not headers.get('Content-Type'):
+                    headers['Content-Type'] = 'application/json'
+                
+                # Update Content-Length if we have data
+                if post_data:
+                    headers['Content-Length'] = str(len(post_data))
+                
+                # Forward to Ollama
+                ollama_response = requests.post(
+                    f"http://localhost:11434{{ollama_path}}",
+                    data=post_data,
+                    headers=headers,
+                    stream=True,
+                    timeout=30
+                )
+                
+                # Forward response
+                self.send_response(ollama_response.status_code)
+                for header, value in ollama_response.headers.items():
+                    if header.lower() not in ['content-encoding', 'transfer-encoding', 'connection']:
+                        self.send_header(header, value)
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                
+                # Stream response content
+                for chunk in ollama_response.iter_content(chunk_size=8192):
+                    if chunk:
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                
+                return
+                
+            except Exception as e:
+                print(f"Error forwarding Ollama API request: {{e}}", file=sys.stderr)
+                self.send_error(500, f"Error forwarding request: {{str(e)}}")
+                return
+        
+        # Parse JSON for OpenAI-compatible endpoints
         try:
             request_data = json.loads(post_data)
-        except:
+        except json.JSONDecodeError:
             self.send_error(400, "Invalid JSON")
             return
         
@@ -2481,7 +2560,7 @@ class OpenAICompatibleHandler(http.server.BaseHTTPRequestHandler):
                             except:
                                 pass
                     
-                    # Send OpenAI-formatted response
+                    # Convert to OpenAI format
                     self.send_response(200)
                     self.send_header('Content-Type', 'application/json')
                     self.send_header('Access-Control-Allow-Origin', '*')
