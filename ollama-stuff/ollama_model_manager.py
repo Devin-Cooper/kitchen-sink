@@ -2282,11 +2282,11 @@ class OpenAICompatibleHandler(http.server.BaseHTTPRequestHandler):
             response = {{
                 "object": "api_info",
                 "version": "v1",
-                "endpoints": ["/v1/models", "/v1/chat/completions"]
+                "endpoints": ["/v1/models", "/v1/chat/completions", "/v1/api/tags"]
             }}
             self.wfile.write(json.dumps(response).encode())
         elif self.path == '/v1/models':
-            # List models endpoint
+            # List models endpoint (OpenAI format)
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Access-Control-Allow-Origin', '*')
@@ -2318,6 +2318,44 @@ class OpenAICompatibleHandler(http.server.BaseHTTPRequestHandler):
                 }}]
             }}
             self.wfile.write(json.dumps(response).encode())
+        elif self.path == '/v1/api/tags':
+            # Ollama-specific endpoint for listing models
+            try:
+                # Forward to actual Ollama API
+                ollama_response = requests.get("http://localhost:11434/api/tags", timeout=5)
+                
+                if ollama_response.status_code == 200:
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Access-Control-Allow-Origin', '*')
+                    self.end_headers()
+                    
+                    # Return only the currently loaded model in Ollama format
+                    models_data = ollama_response.json()
+                    filtered_models = []
+                    
+                    # Find the current model in the list
+                    for model in models_data.get('models', []):
+                        if model.get('name') == MODEL_NAME:
+                            filtered_models.append(model)
+                            break
+                    
+                    # If model not found in list, create a minimal entry
+                    if not filtered_models:
+                        filtered_models.append({{
+                            "name": MODEL_NAME,
+                            "modified_at": datetime.now().isoformat(),
+                            "size": 0,
+                            "digest": "unknown"
+                        }})
+                    
+                    response = {{"models": filtered_models}}
+                    self.wfile.write(json.dumps(response).encode())
+                else:
+                    self.send_error(502, "Failed to fetch models from Ollama")
+            except Exception as e:
+                print(f"Error fetching models: {{e}}", file=sys.stderr)
+                self.send_error(500, f"Error fetching models: {{str(e)}}")
         elif self.path == '/health' or self.path == '/v1/health':
             # Health check endpoint
             self.send_response(200)
@@ -2331,6 +2369,23 @@ class OpenAICompatibleHandler(http.server.BaseHTTPRequestHandler):
                 "timestamp": datetime.now().isoformat()
             }}
             self.wfile.write(json.dumps(response).encode())
+        elif self.path.startswith('/v1/api/'):
+            # Forward any other Ollama API calls
+            ollama_path = self.path[3:]  # Remove '/v1' prefix
+            try:
+                ollama_response = requests.get(f"http://localhost:11434{{ollama_path}}", timeout=5)
+                
+                self.send_response(ollama_response.status_code)
+                for header, value in ollama_response.headers.items():
+                    if header.lower() not in ['content-encoding', 'transfer-encoding', 'connection']:
+                        self.send_header(header, value)
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                
+                self.wfile.write(ollama_response.content)
+            except Exception as e:
+                print(f"Error forwarding request: {{e}}", file=sys.stderr)
+                self.send_error(500, f"Error forwarding request: {{str(e)}}")
         else:
             self.send_error(404)
     
