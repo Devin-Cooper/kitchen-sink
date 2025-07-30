@@ -278,18 +278,75 @@ class ModelDB:
 # Initialize database
 init_db()
 
+# Startup cleanup function
+def cleanup_on_startup():
+    """Ensure all models are unloaded on startup"""
+    print("🧹 Performing startup cleanup...")
+    try:
+        # Get list of all models
+        models = OllamaAPI.list_models()
+        if models:
+            print(f"📋 Found {len(models)} models, checking if any are loaded...")
+            
+            # Try to unload each model
+            for model in models:
+                model_name = model.get('name', '')
+                if model_name:
+                    print(f"   Unloading {model_name}...")
+                    try:
+                        # Send unload request for each model
+                        response = requests.post(
+                            f"{OLLAMA_API_BASE}/api/generate",
+                            json={"model": model_name, "prompt": "", "keep_alive": 0},
+                            timeout=5
+                        )
+                        if response.status_code == 200:
+                            print(f"   ✅ Successfully unloaded {model_name}")
+                        else:
+                            print(f"   ⚠️  Could not unload {model_name}")
+                    except Exception as e:
+                        print(f"   ❌ Error unloading {model_name}: {e}")
+            
+            print("✅ Startup cleanup complete")
+        else:
+            print("✅ No models found to cleanup")
+            
+    except Exception as e:
+        print(f"⚠️  Error during startup cleanup: {e}")
+        print("   Continuing anyway...")
+
 # FastAPI app
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
     print("Starting Ollama Model Manager...")
+    cleanup_on_startup()
     yield
     # Shutdown
     print("Shutting down...")
+    
+    # Stop proxy server if running
+    global proxy_process
+    if proxy_process:
+        print("🛑 Stopping proxy server...")
+        proxy_process.terminate()
+        try:
+            proxy_process.wait(timeout=5)
+        except:
+            proxy_process.kill()
+        proxy_process = None
+    
+    # Clean up proxy files
+    cleanup_proxy_files()
+    
+    # Unload any loaded models
+    if loaded_model["name"]:
+        print(f"📦 Unloading model: {loaded_model['name']}")
+        OllamaAPI.unload_model(loaded_model["name"])
 
 app = FastAPI(lifespan=lifespan)
 
-# HTML Template
+# HTML Template (keeping the same as original)
 HTML_TEMPLATE = '''<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -975,7 +1032,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                     </div>
                     
                     <div id="server-tab" class="tab-panel" style="display: none;">
-                        <h3 style="margin-bottom: 20px; color: #4a9eff;">Cline Server Mode</h3>
+                        <h3 style="margin-bottom: 20px; color: #4a9eff;">OpenAI-Compatible Server Mode</h3>
                         <div class="load-controls">
                             <button class="load-button" id="load-model-server" 
                                     onclick="loadModel()" disabled>Load Model</button>
@@ -995,17 +1052,16 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                         </div>
                         
                         <div style="background: #252525; padding: 20px; border-radius: 8px;">
-                            <h4 style="color: #4a9eff; margin-bottom: 15px;">Cline Configuration</h4>
-                            <p style="margin-bottom: 15px;">Configure Cline with these settings:</p>
+                            <h4 style="color: #4a9eff; margin-bottom: 15px;">Client Configuration</h4>
+                            <p style="margin-bottom: 15px;">Configure your client (Ollamac, Cline, etc.) with these settings:</p>
                             <pre><code>API Provider: OpenAI Compatible
-Base URL: http://localhost:11435/v1
+Base URL: http://192.168.50.24:11435/v1
 API Key: ollama (or any text)
 Model ID: <span id="cline-model-id">Select a model first</span></code></pre>
                             
                             <div style="margin-top: 20px; padding: 15px; background: #1a1a1a; 
                                         border-radius: 5px; border-left: 3px solid #4a9eff;">
-                                <strong>Note:</strong> The server will proxy requests to Ollama with your 
-                                configured parameters. Make sure Ollama is running on port 11434.
+                                <strong>Note:</strong> The server provides OpenAI-compatible endpoints and is accessible from other devices on your network. Make sure Ollama is running on port 11434.
                             </div>
                         </div>
                     </div>
@@ -1937,7 +1993,7 @@ Model ID: <span id="cline-model-id">Select a model first</span></code></pre>
 </body>
 </html>'''
 
-# Routes
+# Routes (keeping the same as original)
 @app.get("/")
 async def home():
     return HTMLResponse(content=HTML_TEMPLATE)
@@ -2153,8 +2209,19 @@ async def download_model(model: str = Query(...)):
     
     return StreamingResponse(generate(), media_type="text/event-stream")
 
-# Cline proxy server
+# OpenAI-compatible proxy server
 proxy_process = None
+
+# Cleanup function for proxy files
+def cleanup_proxy_files():
+    """Remove any leftover proxy script files"""
+    try:
+        proxy_file = Path('ollama_openai_proxy.py')
+        if proxy_file.exists():
+            proxy_file.unlink()
+            print("   🗑️  Removed leftover proxy script")
+    except Exception as e:
+        print(f"   ⚠️  Error cleaning up proxy files: {e}")
 
 @app.post("/api/server/start")
 async def start_server(data: dict):
@@ -2163,53 +2230,281 @@ async def start_server(data: dict):
     if proxy_process:
         return JSONResponse(content={'error': 'Server already running'}, status_code=400)
     
-    # Create a simple proxy server script
-    proxy_script = f'''import http.server
+    # Create an OpenAI-compatible proxy server script
+    proxy_script = f'''#!/usr/bin/env python3
+import http.server
 import socketserver
 import requests
 import json
+import sys
+import time
+import uuid
+from datetime import datetime
 
-class ProxyHandler(http.server.BaseHTTPRequestHandler):
-    def do_POST(self):
-        content_length = int(self.headers['Content-Length'])
-        post_data = self.rfile.read(content_length)
-        
-        # Forward to Ollama
-        target_url = "http://localhost:11434" + self.path
-        headers = dict(self.headers)
-        headers['Host'] = 'localhost:11434'
-        
-        response = requests.post(
-            target_url,
-            data=post_data,
-            headers=headers,
-            stream=True
-        )
-        
-        # Send response
-        self.send_response(response.status_code)
-        for key, value in response.headers.items():
-            if key.lower() not in ['content-encoding', 'transfer-encoding', 'connection']:
-                self.send_header(key, value)
+# The model to use for all requests
+MODEL_NAME = "{data['model']}"
+
+class OpenAICompatibleHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        # Custom logging
+        sys.stderr.write(f"[{{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}}] {{self.address_string()}} - {{format%args}}\\n")
+    
+    def do_HEAD(self):
+        # Handle HEAD requests (same as GET but without body)
+        if self.path in ['/v1/', '/v1', '/health', '/v1/health']:
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+        elif self.path == '/v1/models':
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+        else:
+            self.send_error(404)
+    
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, HEAD')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
         self.end_headers()
-        
-        for chunk in response.iter_content(chunk_size=1024):
-            if chunk:
-                self.wfile.write(chunk)
     
     def do_GET(self):
-        self.do_POST()
+        if self.path == '/v1' or self.path == '/v1/':
+            # Root endpoint - return API info
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            
+            response = {{
+                "object": "api_info",
+                "version": "v1",
+                "endpoints": ["/v1/models", "/v1/chat/completions"]
+            }}
+            self.wfile.write(json.dumps(response).encode())
+        elif self.path == '/v1/models':
+            # List models endpoint
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            
+            response = {{
+                "object": "list",
+                "data": [{{
+                    "id": MODEL_NAME,
+                    "object": "model",
+                    "created": int(time.time()),
+                    "owned_by": "ollama",
+                    "permission": [{{
+                        "id": "modelperm-" + MODEL_NAME,
+                        "object": "model_permission",
+                        "created": int(time.time()),
+                        "allow_create_engine": False,
+                        "allow_sampling": True,
+                        "allow_logprobs": True,
+                        "allow_search_indices": False,
+                        "allow_view": True,
+                        "allow_fine_tuning": False,
+                        "organization": "*",
+                        "group": None,
+                        "is_blocking": False
+                    }}],
+                    "root": MODEL_NAME,
+                    "parent": None
+                }}]
+            }}
+            self.wfile.write(json.dumps(response).encode())
+        elif self.path == '/health' or self.path == '/v1/health':
+            # Health check endpoint
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            
+            response = {{
+                "status": "healthy",
+                "model": MODEL_NAME,
+                "timestamp": datetime.now().isoformat()
+            }}
+            self.wfile.write(json.dumps(response).encode())
+        else:
+            self.send_error(404)
+    
+    def do_POST(self):
+        content_length = int(self.headers.get('Content-Length', 0))
+        post_data = self.rfile.read(content_length)
+        
+        try:
+            request_data = json.loads(post_data)
+        except:
+            self.send_error(400, "Invalid JSON")
+            return
+        
+        if self.path == '/v1/chat/completions':
+            # Chat completions endpoint
+            messages = request_data.get('messages', [])
+            stream = request_data.get('stream', False)
+            
+            # Convert OpenAI format to Ollama format
+            ollama_request = {{
+                "model": MODEL_NAME,
+                "messages": messages,
+                "stream": stream
+            }}
+            
+            # Add options if provided
+            if 'temperature' in request_data:
+                ollama_request.setdefault('options', {{}})['temperature'] = request_data['temperature']
+            if 'max_tokens' in request_data:
+                ollama_request.setdefault('options', {{}})['num_predict'] = request_data['max_tokens']
+            
+            # Forward to Ollama
+            try:
+                ollama_response = requests.post(
+                    "http://localhost:11434/api/chat",
+                    json=ollama_request,
+                    stream=stream,
+                    timeout=5 if not stream else None
+                )
+                
+                # Check if request was successful
+                if not stream and ollama_response.status_code != 200:
+                    self.send_error(502, f"Ollama returned error: {{ollama_response.text}}")
+                    return
+                
+                if stream:
+                    # Streaming response
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'text/event-stream')
+                    self.send_header('Cache-Control', 'no-cache')
+                    self.send_header('Access-Control-Allow-Origin', '*')
+                    self.end_headers()
+                    
+                    for line in ollama_response.iter_lines():
+                        if line:
+                            try:
+                                ollama_data = json.loads(line)
+                                
+                                # Convert Ollama response to OpenAI format
+                                openai_chunk = {{
+                                    "id": f"chatcmpl-{{str(uuid.uuid4())[:8]}}",
+                                    "object": "chat.completion.chunk",
+                                    "created": int(time.time()),
+                                    "model": MODEL_NAME,
+                                    "choices": [{{
+                                        "index": 0,
+                                        "delta": {{
+                                            "content": ollama_data.get('message', {{}}).get('content', '')
+                                        }},
+                                        "finish_reason": None
+                                    }}]
+                                }}
+                                
+                                if ollama_data.get('done', False):
+                                    openai_chunk['choices'][0]['finish_reason'] = 'stop'
+                                
+                                self.wfile.write(f"data: {{json.dumps(openai_chunk)}}\\n\\n".encode())
+                                self.wfile.flush()
+                            except:
+                                pass
+                    
+                    # Send final [DONE] message
+                    self.wfile.write(b"data: [DONE]\\n\\n")
+                else:
+                    # Non-streaming response
+                    full_response = ""
+                    for line in ollama_response.iter_lines():
+                        if line:
+                            try:
+                                data = json.loads(line)
+                                if 'message' in data and 'content' in data['message']:
+                                    full_response += data['message']['content']
+                            except:
+                                pass
+                    
+                    # Send OpenAI-formatted response
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Access-Control-Allow-Origin', '*')
+                    self.end_headers()
+                    
+                    response = {{
+                        "id": f"chatcmpl-{{str(uuid.uuid4())[:8]}}",
+                        "object": "chat.completion",
+                        "created": int(time.time()),
+                        "model": MODEL_NAME,
+                        "choices": [{{
+                            "index": 0,
+                            "message": {{
+                                "role": "assistant",
+                                "content": full_response
+                            }},
+                            "finish_reason": "stop"
+                        }}],
+                        "usage": {{
+                            "prompt_tokens": 0,
+                            "completion_tokens": 0,
+                            "total_tokens": 0
+                        }}
+                    }}
+                    
+                    self.wfile.write(json.dumps(response).encode())
+            
+            except Exception as e:
+                print(f"Error forwarding request: {{e}}", file=sys.stderr)
+                self.send_error(500, f"Error communicating with Ollama: {{str(e)}}")
+        
+        elif self.path == '/v1/completions':
+            # Legacy completions endpoint (convert to chat format)
+            prompt = request_data.get('prompt', '')
+            
+            # Convert to chat format
+            messages = [{{
+                "role": "user",
+                "content": prompt
+            }}]
+            
+            # Forward as chat completion
+            request_data['messages'] = messages
+            self.path = '/v1/chat/completions'
+            self.do_POST()
+        
+        else:
+            self.send_error(404, f"Endpoint {{self.path}} not found")
 
-with socketserver.TCPServer(("", {CLINE_PROXY_PORT}), ProxyHandler) as httpd:
-    print(f"Proxy server running on port {CLINE_PROXY_PORT}")
+# Allow binding to all interfaces for network access
+httpd = socketserver.TCPServer(("0.0.0.0", {CLINE_PROXY_PORT}), OpenAICompatibleHandler)
+httpd.allow_reuse_address = True
+
+print(f"OpenAI-compatible proxy server running on 0.0.0.0:{CLINE_PROXY_PORT}")
+print(f"Using model: {{MODEL_NAME}}")
+print("Accessible from network at http://192.168.50.24:11435/v1")
+print("Endpoints available:")
+print("  - GET  /v1/models")
+print("  - POST /v1/chat/completions")
+print("  - HEAD /v1/")
+sys.stdout.flush()
+
+try:
     httpd.serve_forever()
+except KeyboardInterrupt:
+    print("\\nShutting down proxy server...")
+    httpd.shutdown()
 '''
     
     # Write and run the proxy script
-    with open('ollama_proxy.py', 'w') as f:
+    with open('ollama_openai_proxy.py', 'w') as f:
         f.write(proxy_script)
     
-    proxy_process = subprocess.Popen([sys.executable, 'ollama_proxy.py'])
+    proxy_process = subprocess.Popen([sys.executable, 'ollama_openai_proxy.py'])
+    
+    # Give it a moment to start
+    time.sleep(1)
+    
     return JSONResponse(content={'status': 'started', 'port': CLINE_PROXY_PORT})
 
 @app.post("/api/server/stop")
@@ -2218,7 +2513,12 @@ async def stop_server():
     
     if proxy_process:
         proxy_process.terminate()
+        proxy_process.wait(timeout=5)  # Wait for process to terminate
         proxy_process = None
+        
+        # Clean up proxy script
+        cleanup_proxy_files()
+        
         return JSONResponse(content={'status': 'stopped'})
     
     return JSONResponse(content={'error': 'Server not running'}, status_code=400)
@@ -2241,5 +2541,16 @@ if __name__ == "__main__":
         print("❌ Cannot connect to Ollama! Make sure it's running with: ollama serve")
     except Exception as e:
         print(f"❌ Error checking Ollama: {e}")
+    
+    # Handle graceful shutdown
+    import signal
+    
+    def signal_handler(signum, frame):
+        print("\n⏹️  Received interrupt signal, shutting down gracefully...")
+        # The lifespan handler will take care of cleanup
+        sys.exit(0)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
     
     uvicorn.run(app, host="0.0.0.0", port=8000)
